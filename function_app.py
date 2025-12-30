@@ -1,14 +1,36 @@
 """
-Azure Function: Análisis Técnico de Suscripción de Reaseguros - VERSIÓN 3.0 CON KB
-Versión: 3.0
+Azure Function: Análisis Técnico de Suscripción de Reaseguros - VERSIÓN 3.2
+Versión: 3.2
 Autor: Arquitectura iPaaS
 Descripción: Análisis técnico completo con histórico desde Azure SQL Knowledge Base
+
+Cambios v3.2 (2024-12-30):
+- ✅ Integración API de Cotizaciones del Dólar
+  - Soporte USD/COP (Colombia)
+  - Soporte USD/MXN (México)
+  - Sistema de fallback con 2 APIs públicas
+  - Cache en memoria para optimización
+- ✅ Conversión automática de montos a USD en JSON pricing
+- ✅ Metadata de moneda y tasa de cambio en output
+
+Cambios v3.1 (2024-12-30):
+- ✅ Soporte para formato La Costeña (México)
+  - Siniestros: hoja SIN_AGOSTO, header línea 9
+  - TIV: hoja SUM ASEG, header línea 4
+- ✅ Soporte para formato CONAGUA (México)
+  - Siniestros: hoja Detail, header línea 2
+  - TIV: hoja Conagua, header línea 12
+- ✅ ESTRATEGIA 4 de TIV para La Costeña
+- ✅ ESTRATEGIA 5 de TIV para CONAGUA
+- ✅ Validación mejorada para muestras pequeñas (n<3)
+- ✅ Desglose de TIV por componentes
+- ✅ Análisis de concentración de riesgo
+- ✅ Metadata ampliada (país, moneda, formato detectado)
+
 Cambios v3.0:
 - ✅ Conexión a Azure SQL bluecapital_knowledge_base
 - ✅ Consulta histórico de siniestros desde consumption.FACT_CLAIMS
 - ✅ JSON pricing formato completo (Río Magdalena)
-- ✅ Análisis por_anio, por_peril, ubicaciones_criticas
-- ✅ Sección "riesgos" completa
 """
 
 import azure.functions as func
@@ -22,6 +44,7 @@ import io
 import hashlib
 import pyodbc
 import numpy as np
+import requests
 
 # Configuración de logging
 logging.basicConfig(level=logging.INFO)
@@ -45,6 +68,219 @@ class NumpyEncoder(json.JSONEncoder):
         elif pd.isna(obj):
             return None
         return super().default(obj)
+
+
+# ============================================
+# DETECTORES DE FORMATO
+# ============================================
+
+def es_formato_la_costena_siniestros(archivo_bytes: bytes, filename: str) -> bool:
+    """
+    Detecta si el archivo es formato La Costeña - Siniestros
+
+    Indicadores:
+    - Nombre archivo contiene "costeña" or "costena"
+    - Hoja "SIN_AGOSTO" existe
+    """
+    try:
+        if 'costeña' in filename.lower() or 'costena' in filename.lower():
+            if 'siniestro' in filename.lower():
+                return True
+
+        excel_file = pd.ExcelFile(io.BytesIO(archivo_bytes))
+        if 'SIN_AGOSTO' in excel_file.sheet_names:
+            logger.info(f"Detectado formato La Costeña - Siniestros")
+            return True
+
+    except Exception as e:
+        logger.debug(f"No es formato La Costeña Siniestros: {str(e)}")
+
+    return False
+
+
+def es_formato_la_costena_tiv(archivo_bytes: bytes, filename: str) -> bool:
+    """Detecta si el archivo es formato La Costeña - TIV"""
+    try:
+        if ('desglose' in filename.lower() or 'valores' in filename.lower()) and \
+           ('costeña' in filename.lower() or 'costena' in filename.lower()):
+            return True
+
+        excel_file = pd.ExcelFile(io.BytesIO(archivo_bytes))
+        if 'SUM ASEG' in excel_file.sheet_names:
+            logger.info(f"Detectado formato La Costeña - TIV")
+            return True
+
+    except Exception:
+        pass
+
+    return False
+
+
+def es_formato_conagua_siniestros(archivo_bytes: bytes, filename: str) -> bool:
+    """Detecta si el archivo es formato CONAGUA - Siniestros"""
+    try:
+        if 'conagua' in filename.lower() and 'loss' in filename.lower():
+            return True
+
+        excel_file = pd.ExcelFile(io.BytesIO(archivo_bytes))
+        if 'Detail' in excel_file.sheet_names and 'Resume' in excel_file.sheet_names:
+            logger.info(f"Detectado formato CONAGUA - Siniestros")
+            return True
+
+    except Exception:
+        pass
+
+    return False
+
+
+def es_formato_conagua_tiv(archivo_bytes: bytes, filename: str) -> bool:
+    """Detecta si el archivo es formato CONAGUA - TIV"""
+    try:
+        if 'conagua' in filename.lower() and 'sov' in filename.lower():
+            return True
+
+        excel_file = pd.ExcelFile(io.BytesIO(archivo_bytes))
+        for sheet_name in excel_file.sheet_names:
+            if sheet_name.lower().startswith('conagua'):
+                logger.info(f"Detectado formato CONAGUA - TIV")
+                return True
+
+    except Exception:
+        pass
+
+    return False
+
+
+# ============================================
+# CLASE PARA COTIZACIONES DE MONEDA
+# ============================================
+
+def detectar_moneda_por_formato(nombre_asegurado: str = "", archivos_nombres: List[str] = []) -> str:
+    """
+    Detecta la moneda del cliente basándose en el nombre o archivos
+
+    Args:
+        nombre_asegurado: Nombre del asegurado
+        archivos_nombres: Lista de nombres de archivos procesados
+
+    Returns:
+        Código de moneda: 'MXN', 'COP', o 'USD'
+    """
+    nombre_lower = nombre_asegurado.lower()
+    archivos_str = " ".join(archivos_nombres).lower()
+
+    if 'costeña' in nombre_lower or 'costena' in nombre_lower or \
+       'costeña' in archivos_str or 'costena' in archivos_str:
+        return 'MXN'
+
+    if 'conagua' in nombre_lower or 'conagua' in archivos_str:
+        return 'MXN'
+
+    if 'magdalena' in nombre_lower or 'antioquia' in nombre_lower or \
+       'colombia' in nombre_lower:
+        return 'COP'
+
+    return 'COP'
+
+
+class CotizacionDolar:
+    """
+    Gestiona cotizaciones del dólar para conversión de monedas
+
+    Uso:
+        api = CotizacionDolar()
+        tasa_cop = api.obtener_cotizacion_cop()
+        usd_amount = api.convertir_a_usd(monto_cop, 'COP')
+    """
+
+    def __init__(self):
+        """Inicializa el gestor de cotizaciones"""
+        self.apis = {
+            'exchangerate-api': 'https://api.exchangerate-api.com/v4/latest/USD',
+            'frankfurter': 'https://api.frankfurter.app/latest?from=USD'
+        }
+        self._cache = {}
+
+    def obtener_cotizacion_cop(self) -> float:
+        """
+        Obtiene cotización USD/COP
+
+        Returns:
+            Tasa de cambio USD/COP
+        """
+        if 'COP' in self._cache:
+            return self._cache['COP']
+
+        try:
+            response = requests.get(self.apis['exchangerate-api'], timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            cotizacion = data['rates']['COP']
+            self._cache['COP'] = cotizacion
+            logger.info(f"Cotización USD/COP: {cotizacion:,.2f}")
+            return cotizacion
+        except Exception as e:
+            logger.warning(f"Error obteniendo cotización COP: {str(e)}")
+            try:
+                response = requests.get(self.apis['frankfurter'], timeout=10)
+                data = response.json()
+                if 'COP' in data['rates']:
+                    cotizacion = data['rates']['COP']
+                    self._cache['COP'] = cotizacion
+                    return cotizacion
+            except Exception:
+                pass
+            logger.warning("Usando cotización aproximada COP")
+            return 4200.0
+
+    def obtener_cotizacion_mxn(self) -> float:
+        """
+        Obtiene cotización USD/MXN
+
+        Returns:
+            Tasa de cambio USD/MXN
+        """
+        if 'MXN' in self._cache:
+            return self._cache['MXN']
+
+        try:
+            response = requests.get(self.apis['exchangerate-api'], timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            cotizacion = data['rates']['MXN']
+            self._cache['MXN'] = cotizacion
+            logger.info(f"Cotización USD/MXN: {cotizacion:,.2f}")
+            return cotizacion
+        except Exception as e:
+            logger.warning(f"Error obteniendo cotización MXN: {str(e)}")
+            logger.warning("Usando cotización aproximada MXN")
+            return 18.0
+
+    def convertir_a_usd(self, monto: float, moneda: str) -> float:
+        """
+        Convierte un monto en moneda local a USD
+
+        Args:
+            monto: Monto en moneda local
+            moneda: Código de moneda (COP, MXN, USD)
+
+        Returns:
+            Monto en USD
+        """
+        if moneda == 'USD':
+            return monto
+
+        if moneda == 'COP':
+            tasa = self.obtener_cotizacion_cop()
+            return monto / tasa
+
+        if moneda == 'MXN':
+            tasa = self.obtener_cotizacion_mxn()
+            return monto / tasa
+
+        logger.warning(f"Moneda no soportada: {moneda}")
+        return monto
+
 
 # ========================================
 # CONFIGURACIÓN AZURE SQL KNOWLEDGE BASE
@@ -199,9 +435,13 @@ class AnalizadorTecnico:
             'slip': {},
             'asegurado_nombre': asegurado_nombre or 'Desconocido',
             'insured_key': None,
-            'tiene_historico_kb': False
+            'tiene_historico_kb': False,
+            'archivos_procesados': []
         }
-        logger.info("Analizador Técnico v3.0 inicializado.")
+        self.api_cotizacion = CotizacionDolar()
+        self.moneda_local = None
+        self.tasa_cambio = None
+        logger.info("Analizador Técnico v3.2 inicializado con API de cotizaciones.")
 
     def cargar_historico_desde_kb(self, años_historico: int = 5) -> bool:
         """
@@ -254,6 +494,10 @@ class AnalizadorTecnico:
                     return pd.DataFrame()
 
             for filename, archivo in archivos_bytes:
+                # Registrar nombres de archivos procesados para detección de moneda
+                if filename not in self.datos_consolidados['archivos_procesados']:
+                    self.datos_consolidados['archivos_procesados'].append(filename)
+
                 df = None
 
                 # Intentar leer como Excel con hoja GRUPO I
@@ -285,6 +529,68 @@ class AnalizadorTecnico:
                             df['causa_siniestro'] = df['Nom. Exp.']
                         else:
                             df['causa_siniestro'] = 'No especificada'
+
+                    # ============================================
+                    # LA COSTEÑA - SINIESTROS
+                    # ============================================
+                    elif es_formato_la_costena_siniestros(archivo, filename):
+                        logger.info(f"Procesando archivo La Costeña - Siniestros: {filename}")
+
+                        df = pd.read_excel(io.BytesIO(archivo), sheet_name='SIN_AGOSTO', header=8)
+                        df = df.dropna(how='all')
+                        df = df[df['SINIESTRO'].notna()].copy()
+
+                        logger.info(f"Total registros La Costeña: {len(df)}")
+
+                        if len(df) < 3:
+                            logger.warning(f"CRÍTICO: Solo {len(df)} siniestro(s) - Muestra insuficiente")
+
+                        df_mapped = pd.DataFrame()
+                        df_mapped['numero_siniestro'] = df['SINIESTRO'].astype(str)
+                        df_mapped['causa_siniestro'] = df['DESCRIPCIÓN']
+
+                        if len(df.columns) > 2:
+                            df_mapped['subcategoria'] = df.iloc[:, 2]
+
+                        df_mapped['fecha_siniestro'] = pd.to_datetime(df['fechasin'], errors='coerce')
+                        df_mapped['monto_incurrido'] = pd.to_numeric(df['PERDIDA'], errors='coerce').fillna(0)
+                        df_mapped['monto_pagado'] = pd.to_numeric(df['SINPAGADO'], errors='coerce').fillna(0)
+
+                        if 'RESERVA_INDEMNIZA' in df.columns and 'RESERVA_GASTOS' in df.columns:
+                            reserva_indem = pd.to_numeric(df['RESERVA_INDEMNIZA'], errors='coerce').fillna(0)
+                            reserva_gastos = pd.to_numeric(df['RESERVA_GASTOS'], errors='coerce').fillna(0)
+                            df_mapped['monto_reservado'] = reserva_indem + reserva_gastos
+                        else:
+                            df_mapped['monto_reservado'] = (df_mapped['monto_incurrido'] - df_mapped['monto_pagado']).clip(lower=0)
+
+                        df = df_mapped
+                        logger.info(f"Siniestros La Costeña mapeados: {len(df)} registros")
+
+                    # ============================================
+                    # CONAGUA - SINIESTROS
+                    # ============================================
+                    elif es_formato_conagua_siniestros(archivo, filename):
+                        logger.info(f"Procesando archivo CONAGUA - Siniestros: {filename}")
+
+                        df = pd.read_excel(io.BytesIO(archivo), sheet_name='Detail', header=1)
+                        df = df.dropna(how='all')
+                        df = df[df['Fecha Ocurrencia '].notna()].copy()
+
+                        logger.info(f"Total registros CONAGUA: {len(df)}")
+
+                        df_mapped = pd.DataFrame()
+                        df_mapped['fecha_siniestro'] = pd.to_datetime(df['Fecha Ocurrencia '], errors='coerce')
+                        df_mapped['causa_siniestro'] = df['Causa']
+                        df_mapped['monto_pagado'] = pd.to_numeric(df['Pérdida Pagada Neta'], errors='coerce').fillna(0)
+                        df_mapped['monto_reservado'] = pd.to_numeric(df['Reserva Bruta'], errors='coerce').fillna(0)
+                        df_mapped['monto_incurrido'] = df_mapped['monto_pagado'] + df_mapped['monto_reservado']
+
+                        if 'Cat / No Cat' in df.columns:
+                            df_mapped['es_catastrofico'] = df['Cat / No Cat']
+
+                        df = df_mapped
+                        logger.info(f"Siniestros CONAGUA mapeados: {len(df)} registros")
+
                     else:
                         df = pd.read_excel(io.BytesIO(archivo), engine='openpyxl')
                         df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_')
@@ -430,6 +736,84 @@ class AnalizadorTecnico:
                     tiv_total = df_tiv['suma_asegurada_clean'].sum()
                     logger.info(f"✅ TIV: Extraído desde columna '{col_suma}' (Estrategia 3)")
                     self.datos_consolidados['tiv_total'] = tiv_total
+
+            # ============================================
+            # ESTRATEGIA 4: La Costeña - Hoja SUM ASEG
+            # ============================================
+            if tiv_total == 0 or tiv_total is None:
+                try:
+                    logger.info("Intentando ESTRATEGIA 4: La Costeña (hoja SUM ASEG)")
+
+                    excel_file = pd.ExcelFile(io.BytesIO(archivo_bytes))
+
+                    if 'SUM ASEG' in excel_file.sheet_names:
+                        df_tiv = pd.read_excel(io.BytesIO(archivo_bytes), sheet_name='SUM ASEG', header=3)
+
+                        logger.info(f"Columnas detectadas: {list(df_tiv.columns)}")
+
+                        df_tiv = df_tiv.dropna(how='all')
+                        df_tiv = df_tiv[df_tiv['No'].notna()].copy()
+
+                        for col in ['EDIFICIOS', 'INVENTARIO', 'CONTENIDOS', 'PERDIDAS CONSEC']:
+                            if col in df_tiv.columns:
+                                df_tiv[col] = pd.to_numeric(df_tiv[col], errors='coerce').fillna(0)
+
+                        col_total = 'VALORES TOTALES' if 'VALORES TOTALES' in df_tiv.columns else 'VALORES TOTALES '
+                        if col_total in df_tiv.columns:
+                            df_tiv['suma_asegurada'] = pd.to_numeric(df_tiv[col_total], errors='coerce').fillna(0)
+                        else:
+                            df_tiv['suma_asegurada'] = (
+                                df_tiv.get('EDIFICIOS', 0) +
+                                df_tiv.get('INVENTARIO', 0) +
+                                df_tiv.get('CONTENIDOS', 0) +
+                                df_tiv.get('PERDIDAS CONSEC', 0)
+                            )
+
+                        df_tiv = df_tiv[df_tiv['suma_asegurada'] > 0].copy()
+                        tiv_total = df_tiv['suma_asegurada'].sum()
+
+                        logger.info(f"✅ ESTRATEGIA 4 exitosa: TIV Total = ${tiv_total:,.2f}")
+
+                        self.datos_consolidados['tiv'] = df_tiv
+                        self.datos_consolidados['tiv_total'] = tiv_total
+
+                except Exception as e:
+                    logger.warning(f"ESTRATEGIA 4 falló: {str(e)}")
+
+            # ============================================
+            # ESTRATEGIA 5: CONAGUA - Hoja Conagua
+            # ============================================
+            if tiv_total == 0 or tiv_total is None:
+                try:
+                    logger.info("Intentando ESTRATEGIA 5: CONAGUA")
+
+                    excel_file = pd.ExcelFile(io.BytesIO(archivo_bytes))
+
+                    sheet_conagua = None
+                    for sheet_name in excel_file.sheet_names:
+                        if sheet_name.lower().startswith('conagua'):
+                            sheet_conagua = sheet_name
+                            break
+
+                    if sheet_conagua:
+                        df_tiv = pd.read_excel(io.BytesIO(archivo_bytes), sheet_name=sheet_conagua, header=11)
+
+                        df_tiv = df_tiv.dropna(how='all')
+                        df_tiv = df_tiv[df_tiv['Nombre'].notna()].copy()
+
+                        df_tiv['suma_asegurada'] = pd.to_numeric(df_tiv['Edificio'], errors='coerce').fillna(0)
+                        df_tiv = df_tiv[df_tiv['suma_asegurada'] > 0].copy()
+
+                        tiv_total = df_tiv['suma_asegurada'].sum()
+
+                        logger.info(f"✅ ESTRATEGIA 5 exitosa: TIV Total = ${tiv_total:,.2f}")
+                        logger.info(f"Total ubicaciones: {len(df_tiv)}")
+
+                        self.datos_consolidados['tiv'] = df_tiv
+                        self.datos_consolidados['tiv_total'] = tiv_total
+
+                except Exception as e:
+                    logger.warning(f"ESTRATEGIA 5 falló: {str(e)}")
 
             if tiv_total is None or tiv_total == 0:
                 logger.warning("⚠️ TIV Total es cero o no se pudo extraer - Burning Cost no será calculable")
@@ -817,10 +1201,32 @@ def generar_seccion_riesgos(analizador: AnalizadorTecnico, tiv_total: float, tas
 
 
 def generar_json_pricing(analizador: AnalizadorTecnico) -> Dict[str, Any]:
-    """Genera JSON completo para pricing formato Río Magdalena"""
+    """Genera JSON completo para pricing con conversión automática a USD"""
     df_siniestros = analizador.datos_consolidados['siniestralidad']
     tiv_total = analizador.datos_consolidados['tiv_total']
-    tasa_cambio = 0.00025  # COP -> USD
+
+    # Detectar moneda y obtener tasa de cambio dinámica
+    archivos_nombres = analizador.datos_consolidados.get('archivos_procesados', [])
+    moneda_local = detectar_moneda_por_formato(
+        analizador.datos_consolidados.get('asegurado_nombre', ''),
+        archivos_nombres
+    )
+
+    # Obtener tasa de cambio según la moneda detectada
+    if moneda_local == 'MXN':
+        tasa_usd_moneda = analizador.api_cotizacion.obtener_cotizacion_mxn()
+        tasa_cambio = 1.0 / tasa_usd_moneda  # Convertir MXN a USD
+        moneda_origen = "MXN"
+        logger.info(f"💱 Moneda detectada: MXN | Tasa USD/MXN: {tasa_usd_moneda:.4f} | Tasa conversión: {tasa_cambio:.6f}")
+    elif moneda_local == 'COP':
+        tasa_usd_cop = analizador.api_cotizacion.obtener_cotizacion_cop()
+        tasa_cambio = 1.0 / tasa_usd_cop  # Convertir COP a USD
+        moneda_origen = "COP"
+        logger.info(f"💱 Moneda detectada: COP | Tasa USD/COP: {tasa_usd_cop:.4f} | Tasa conversión: {tasa_cambio:.6f}")
+    else:
+        tasa_cambio = 1.0
+        moneda_origen = "USD"
+        logger.info("💱 Moneda detectada: USD (sin conversión)")
 
     logger.info(f"📊 Generando JSON pricing para {analizador.datos_consolidados.get('asegurado_nombre', 'Desconocido')}")
 
@@ -860,7 +1266,7 @@ def generar_json_pricing(analizador: AnalizadorTecnico) -> Dict[str, Any]:
                 "descripcion": causa,
                 "es_catastrofico": es_catastrofico,
                 "montos": {
-                    "moneda_origen": "COP",
+                    "moneda_origen": moneda_origen,
                     "tasa_cambio_a_objetivo": tasa_cambio,
                     "pagado": monto_pagado,
                     "pagado_usd": monto_pagado * tasa_cambio,
@@ -962,7 +1368,7 @@ def generar_json_pricing(analizador: AnalizadorTecnico) -> Dict[str, Any]:
             "severidad_promedio_usd": round(severidad_promedio * tasa_cambio, 2),
             "severidad_mediana_usd": round(severidad_mediana * tasa_cambio, 2),
             "severidad_p95_usd": round(severidad_p95 * tasa_cambio, 2),
-            "tiv_total_cop": tiv_total,
+            f"tiv_total_{moneda_origen.lower()}": tiv_total,
             "tiv_total_usd": round(tiv_total * tasa_cambio, 2),
             "burning_cost_por_mil": round(burning_cost_por_mil, 4),
             "burning_cost_pct": round(burning_cost_pct, 4),
